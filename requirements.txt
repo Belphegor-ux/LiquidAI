@@ -1,0 +1,15 @@
+# NeuroFlow - cross-patient seizure prediction (CfC / Liquid Neural Networks)
+# Install the Liquid network library first:  pip install -e ./ncps  (or: pip install ncps)
+ncps>=1.0.0
+torch>=2.1
+pytorch-lightning>=2.1
+torchmetrics>=1.2
+mne>=1.6
+numpy>=1.24
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.3
+matplotlib>=3.7
+seaborn>=0.13
+tqdm>=4.66
+streamlit>=1.30
