@@ -6,6 +6,8 @@ Monitor:  tail -f logs/training.log
 """
 
 import json
+import os
+import sys
 
 import numpy as np
 import torch
@@ -15,6 +17,25 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 import config
 from model import CfCSeizurePredictor
+
+# Windows consoles may use a non-UTF-8 code page (e.g. cp932); force UTF-8 so the
+# Lightning Rich progress bar's Unicode glyphs don't crash the run with
+# UnicodeEncodeError. errors="replace" guards any remaining odd characters.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _resume_ckpt():
+    """Latest 'last' checkpoint to resume from, or None.
+
+    Opt in with `python train.py --resume` or NEUROFLOW_RESUME=1; restores epoch,
+    optimizer state and callbacks so a paused run continues instead of restarting.
+    """
+    if "--resume" not in sys.argv and os.environ.get("NEUROFLOW_RESUME") != "1":
+        return None
+    candidates = sorted(config.MODEL_DIR.glob("last*.ckpt"), key=lambda p: p.stat().st_mtime)
+    return str(candidates[-1]) if candidates else None
 
 
 def _weighted_sampler(labels):
@@ -45,8 +66,10 @@ def main():
     val_ds = TensorDataset(segments[val_idx], labels[val_idx])
 
     train_loader = DataLoader(
-        train_ds, batch_size=config.BATCH_SIZE,
-        sampler=_weighted_sampler(labels_np[train_idx]), num_workers=0,
+        train_ds,
+        batch_size=config.BATCH_SIZE,
+        sampler=_weighted_sampler(labels_np[train_idx]),
+        num_workers=0,
     )
     val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -55,21 +78,28 @@ def main():
     checkpoint = ModelCheckpoint(
         dirpath=str(config.MODEL_DIR),
         filename="cfc100-{epoch:02d}-{val_auc:.3f}",
-        monitor="val_auc", mode="max", save_top_k=1, save_last=True,
+        monitor="val_auc",
+        mode="max",
+        save_top_k=1,
+        save_last=True,
     )
     early_stop = EarlyStopping(monitor="val_auc", mode="max", patience=20)
 
     trainer = Trainer(
         max_epochs=config.MAX_EPOCHS,
         callbacks=[checkpoint, early_stop],
-        accelerator="auto", devices=1,
+        accelerator="auto",
+        devices=1,
         log_every_n_steps=10,
-        gradient_clip_val=1.0,                 # guards against CfC NaN divergence
+        gradient_clip_val=1.0,  # guards against CfC NaN divergence
         precision="16-mixed" if torch.cuda.is_available() else "32-true",
         default_root_dir=str(config.LOG_DIR),
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    ckpt_path = _resume_ckpt()
+    if ckpt_path:
+        print(f"Resuming from {ckpt_path}")
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
     print("Training complete. Best model:", checkpoint.best_model_path)
 
 

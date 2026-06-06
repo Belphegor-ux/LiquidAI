@@ -21,11 +21,15 @@ def find_checkpoint(explicit=None):
     """Return the best checkpoint path: explicit arg, else best val_auc, else last."""
     if explicit:
         return explicit
-    ckpts = [p for p in config.MODEL_DIR.glob("cfc100-*.ckpt")]
+    ckpts = list(config.MODEL_DIR.glob("cfc100-*.ckpt"))
     if ckpts:
         # Filename encodes val_auc; pick the highest.
-        return str(max(ckpts, key=lambda p: float(p.stem.split("val_auc=")[-1])
-                       if "val_auc=" in p.stem else -1.0))
+        return str(
+            max(
+                ckpts,
+                key=lambda p: float(p.stem.split("val_auc=")[-1]) if "val_auc=" in p.stem else -1.0,
+            )
+        )
     last = config.MODEL_DIR / "last.ckpt"
     if last.exists():
         return str(last)
@@ -58,7 +62,14 @@ def main():
     test_labels = labels[test_idx]
     test_preds = predict_in_batches(model, test_segments, device)
 
-    auc = roc_auc_score(test_labels, test_preds)
+    # AUROC/ROC are undefined when the test set has a single class (which can
+    # happen if the held-out test patient has no preictal segments).
+    single_class = len(np.unique(test_labels)) < 2
+    if single_class:
+        print("WARNING: test set has a single class; AUC/ROC undefined.")
+        auc = float("nan")
+    else:
+        auc = roc_auc_score(test_labels, test_preds)
     cm = confusion_matrix(test_labels, (test_preds > 0.5).astype(int), labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
@@ -70,19 +81,27 @@ def main():
     print(f"Confusion matrix [[tn fp][fn tp]]:\n{cm}")
 
     with open(config.RESULTS_DIR / "evaluation.json", "w") as f:
-        json.dump({
-            "checkpoint": ckpt,
-            "auc": float(auc),
-            "sensitivity": float(sensitivity),
-            "specificity": float(specificity),
-            "confusion_matrix": cm.tolist(),
-        }, f, indent=2)
+        json.dump(
+            {
+                "checkpoint": ckpt,
+                "auc": float(auc),
+                "sensitivity": float(sensitivity),
+                "specificity": float(specificity),
+                "confusion_matrix": cm.tolist(),
+            },
+            f,
+            indent=2,
+        )
 
-    _save_roc_curve(test_labels, test_preds, auc)
+    if single_class:
+        print("Skipping ROC curve (single-class test set).")
+    else:
+        _save_roc_curve(test_labels, test_preds, auc)
 
 
 def _save_roc_curve(labels, preds, auc):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 

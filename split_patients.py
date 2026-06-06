@@ -44,16 +44,21 @@ def main():
 
     # Sanity: no patient appears in more than one set.
     sets = [set(split["train_patients"]), set(split["val_patients"]), set(split["test_patients"])]
-    assert not (sets[0] & sets[1]) and not (sets[0] & sets[2]) and not (sets[1] & sets[2]), \
+    assert not (sets[0] & sets[1]) and not (sets[0] & sets[2]) and not (sets[1] & sets[2]), (
         "Patient leakage detected between splits"
+    )
 
     with open(config.OUTPUT_DIR / "split.json", "w") as f:
         json.dump(split, f)
 
-    print(f"Patients  -> train {len(split['train_patients'])} | "
-          f"val {len(split['val_patients'])} | test {len(split['test_patients'])}")
-    print(f"Segments  -> train {len(split['train_idx'])} | "
-          f"val {len(split['val_idx'])} | test {len(split['test_idx'])}")
+    print(
+        f"Patients  -> train {len(split['train_patients'])} | "
+        f"val {len(split['val_patients'])} | test {len(split['test_patients'])}"
+    )
+    print(
+        f"Segments  -> train {len(split['train_idx'])} | "
+        f"val {len(split['val_idx'])} | test {len(split['test_idx'])}"
+    )
 
     labels = np.load(config.OUTPUT_DIR / "labels.npy")
     for name in ("train", "val", "test"):

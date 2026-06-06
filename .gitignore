@@ -21,3 +21,12 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# Large data and temp files
+EEG_Scaled_data.csv
+chb-mit-scalp-eeg-main/
+chb01-summary.txt
+_chb01_files.json
+_lfm_url.txt
+herdr-master.zip
+.claude/

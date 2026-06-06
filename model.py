@@ -17,8 +17,12 @@ import config
 
 
 class CfCSeizurePredictor(LightningModule):
-    def __init__(self, input_size=config.N_CHANNELS, hidden_size=config.HIDDEN_SIZE,
-                 learning_rate=config.LEARNING_RATE):
+    def __init__(
+        self,
+        input_size=config.N_CHANNELS,
+        hidden_size=config.HIDDEN_SIZE,
+        learning_rate=config.LEARNING_RATE,
+    ):
         super().__init__()
         self.save_hyperparameters()
 
@@ -39,7 +43,7 @@ class CfCSeizurePredictor(LightningModule):
 
     def forward(self, x):
         """x: (batch, time, channels) -> (batch,) logits."""
-        out, _ = self.cfc(x)          # (batch, hidden_size)
+        out, _ = self.cfc(x)  # (batch, hidden_size)
         return self.readout(out).squeeze(-1)
 
     @torch.no_grad()
@@ -65,9 +69,14 @@ class CfCSeizurePredictor(LightningModule):
             return
         preds = torch.cat(self._val_preds).numpy()
         targets = torch.cat(self._val_targets).numpy()
-        # AUROC is undefined with a single class present; guard for early epochs.
+        # AUROC is undefined with a single class present. Still log a neutral 0.5
+        # so val_auc always exists -- otherwise the checkpoint/early-stop monitors
+        # crash on degenerate val splits (preictal segments are scarce).
         if len(set(targets.tolist())) > 1:
-            self.log("val_auc", roc_auc_score(targets, preds), on_epoch=True, prog_bar=True)
+            auc = roc_auc_score(targets, preds)
+        else:
+            auc = 0.5
+        self.log("val_auc", auc, on_epoch=True, prog_bar=True)
         self._val_preds.clear()
         self._val_targets.clear()
 
