@@ -1,19 +1,24 @@
-"""Load CHB-MIT EDFs, filter, decimate, segment into 30-min windows, and label.
+"""Load CHB-MIT EDFs, filter, resample to 128 Hz, cut into short epochs, and label.
 
 Outputs (in config.OUTPUT_DIR):
-  segments.npy     (n_segments, SEQ_LEN, N_CHANNELS) float32
-  labels.npy       (n_segments,) int8  -- 1 preictal, 0 interictal
-  patient_ids.json [patient_id per segment]
+  segments.npy        (n_segments, SEQ_LEN, N_CHANNELS) float32  -- SEQ_LEN-sample epochs
+  labels.npy          (n_segments,) int8   -- 1 preictal, 0 interictal
+  patient_ids.json    [patient_id per segment]
+  seizure_groups.json [seizure id per segment; "" for interictal] -- for per-seizure eval
 
 Run:  python preprocess.py
 """
 
 import json
 import re
+import shutil
+import tempfile
+import zlib
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 import mne
 import numpy as np
-from scipy.signal import resample_poly
 
 import config
 
@@ -32,89 +37,125 @@ def preprocess_edf(edf_path):
     """
     raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
 
-    # Drop non-EEG channels (ECG/VNS/etc.) so every file has the same montage.
-    drop = [c for c in raw.ch_names if c.upper() in config.NON_EEG_CHANNELS]
-    if drop:
-        raw.drop_channels(drop)
+    # Select the canonical 23-channel montage by name, in a fixed order. CHB-MIT
+    # recordings pad with placeholder "-" channels and extra references and vary
+    # their channel ordering; picking an explicit allowlist drops the extras and
+    # forces identical channels in identical order across every file. Check before
+    # filtering so files missing canonical channels skip cheaply.
+    canonical = list(config.CANONICAL_CHANNELS)
+    missing = [c for c in canonical if c not in raw.ch_names]
+    if missing:
+        raise ValueError(f"missing {len(missing)} canonical channels, e.g. {missing[:3]}")
+    raw.pick(canonical)
+    raw.reorder_channels(canonical)  # pick() keeps source order; enforce ours
 
     raw.filter(config.FREQ_BAND[0], config.FREQ_BAND[1], verbose=False)
     raw.notch_filter(config.NOTCH_FREQ, verbose=False)
+    # Resample to EPOCH_SAMPLE_RATE (128 Hz) -- high enough to keep the gamma band
+    # (Nyquist 64 Hz) that carries preictal signal. MNE handles anti-aliasing.
+    if round(raw.info["sfreq"]) != config.EPOCH_SAMPLE_RATE:
+        raw.resample(config.EPOCH_SAMPLE_RATE, verbose=False)
 
-    data = raw.get_data()  # (n_channels, n_samples)
+    data = raw.get_data()  # (n_channels, n_samples) at EPOCH_SAMPLE_RATE
     if data.shape[0] != config.N_CHANNELS:
         raise ValueError(f"{data.shape[0]} channels after cleanup, expected {config.N_CHANNELS}")
 
     mean = data.mean(axis=1, keepdims=True)
     std = data.std(axis=1, keepdims=True) + 1e-8
     data = (data - mean) / std
-    return data, raw.info["sfreq"]
+    return data, config.EPOCH_SAMPLE_RATE
 
 
-def _decimate_window(window, src_hz):
-    """Resample a (n_channels, n_samples) window from src_hz to DOWNSAMPLE_HZ.
+def _epoch_starts(lo_sec, hi_sec):
+    """Start times (seconds) of EPOCH_SECONDS epochs fully inside [lo, hi).
 
-    Returns (SEQ_LEN, n_channels) so it feeds an RNN as (time, features).
+    Stepped by EPOCH_STRIDE_SECONDS; each epoch must end at or before hi.
     """
-    decimated = resample_poly(window, up=config.DOWNSAMPLE_HZ, down=int(src_hz), axis=1)
-    # Pad / trim to the exact expected length so every example is uniform.
-    if decimated.shape[1] < config.SEQ_LEN:
-        pad = config.SEQ_LEN - decimated.shape[1]
-        decimated = np.pad(decimated, ((0, 0), (0, pad)), mode="edge")
-    decimated = decimated[:, : config.SEQ_LEN]
-    return decimated.T.astype(np.float32)  # (SEQ_LEN, n_channels)
+    starts, s = [], lo_sec
+    while s + config.EPOCH_SECONDS <= hi_sec:
+        starts.append(s)
+        s += config.EPOCH_STRIDE_SECONDS
+    return starts
 
 
 def _overlaps_seizure(start_sec, end_sec, seizure_times):
     """True if [start_sec, end_sec) overlaps any seizure's exclusion zone."""
     for onset, offset in seizure_times:
-        ex_start = onset - config.PREICTAL_SECONDS
+        ex_start = onset - config.PREICTAL_HORIZON_SECONDS
         ex_end = offset + config.POSTICTAL_SECONDS
         if start_sec < ex_end and end_sec > ex_start:
             return True
     return False
 
 
-def label_segments(data, seizure_times, sfreq):
-    """Build preictal (1) and interictal (0) examples from one recording.
+def _slice_epoch(data, start_sec, sfreq, epoch_samples):
+    """Return one (SEQ_LEN, n_channels) epoch starting at start_sec, or None."""
+    i0 = int(round(start_sec * sfreq))
+    i1 = i0 + epoch_samples
+    if i1 > data.shape[1]:
+        return None
+    return data[:, i0:i1].T.astype(np.float32)
 
-    Preictal: the slice [onset - PREICTAL_SECONDS, onset) for each seizure (one
-    positive per seizure), provided at least MIN_PREICTAL_SECONDS of real
-    pre-onset data exists; it is decimated and padded to SEQ_LEN.
 
-    Interictal: non-overlapping WINDOW_SECONDS windows that do not overlap any
-    seizure's [onset - PREICTAL_SECONDS, offset + POSTICTAL_SECONDS] zone, so
-    negatives are clear of pre/post-ictal activity.
+def label_segments(data, seizure_times, sfreq, rng):
+    """Build preictal (1) and interictal (0) epoch examples from one recording.
 
-    Returns (segments, labels) with segments shaped (n, SEQ_LEN, N_CHANNELS).
+    Preictal: EPOCH_SECONDS epochs inside [onset - PREICTAL_HORIZON_SECONDS,
+    onset - SPH_SECONDS] for each seizure (SPH excludes the last minutes for
+    real lead-time). Each preictal epoch is tagged with its seizure onset so the
+    evaluator can score per-seizure.
+
+    Interictal: epochs outside every seizure's [onset - HORIZON, offset +
+    POSTICTAL] zone, randomly subsampled to INTERICTAL_PER_FILE to bound size.
+
+    Returns (segments, labels, groups): segments (n, SEQ_LEN, N_CHANNELS);
+    groups holds the seizure onset (int) for preictal epochs, -1 for interictal.
     """
-    window_samples = int(config.WINDOW_SECONDS * sfreq)
-    min_preictal_samples = int(config.MIN_PREICTAL_SECONDS * sfreq)
-    n_samples = data.shape[1]
+    epoch_samples = int(config.EPOCH_SECONDS * sfreq)
+    total_sec = data.shape[1] / sfreq
 
-    segments, labels = [], []
+    segments, labels, groups = [], [], []
 
-    # Preictal positives: explicit per-seizure slice ending at onset.
+    # Preictal epochs, grouped by seizure onset.
     for onset, _offset in seizure_times:
-        onset_sample = int(onset * sfreq)
-        start_sample = max(0, onset_sample - window_samples)
-        window = data[:, start_sample:onset_sample]
-        if window.shape[1] < min_preictal_samples:
-            continue  # too little real pre-onset data (rest lies in prior file)
-        segments.append(_decimate_window(window, sfreq))
-        labels.append(1)
+        lo = max(0.0, onset - config.PREICTAL_HORIZON_SECONDS)
+        hi = min(onset - config.SPH_SECONDS, total_sec)
+        for start_sec in _epoch_starts(lo, hi):
+            epoch = _slice_epoch(data, start_sec, sfreq, epoch_samples)
+            if epoch is None:
+                continue
+            segments.append(epoch)
+            labels.append(1)
+            groups.append(int(onset))
 
-    # Interictal negatives: clean non-overlapping windows.
-    for seg_idx in range(n_samples // window_samples):
-        start = seg_idx * window_samples
-        end = start + window_samples
-        if _overlaps_seizure(start / sfreq, end / sfreq, seizure_times):
+    # Interictal candidates, then subsample.
+    candidates = [
+        s
+        for s in _epoch_starts(0.0, total_sec)
+        if not _overlaps_seizure(s, s + config.EPOCH_SECONDS, seizure_times)
+    ]
+    if len(candidates) > config.INTERICTAL_PER_FILE:
+        keep = rng.choice(len(candidates), config.INTERICTAL_PER_FILE, replace=False)
+        candidates = [candidates[i] for i in sorted(keep)]
+    for start_sec in candidates:
+        epoch = _slice_epoch(data, start_sec, sfreq, epoch_samples)
+        if epoch is None:
             continue
-        segments.append(_decimate_window(data[:, start:end], sfreq))
+        segments.append(epoch)
         labels.append(0)
+        groups.append(-1)
 
     if not segments:
-        return np.empty((0, config.SEQ_LEN, config.N_CHANNELS), np.float32), np.empty((0,), np.int8)
-    return np.stack(segments).astype(np.float32), np.array(labels, dtype=np.int8)
+        return (
+            np.empty((0, config.SEQ_LEN, config.N_CHANNELS), np.float32),
+            np.empty((0,), np.int8),
+            np.empty((0,), np.int64),
+        )
+    return (
+        np.stack(segments).astype(np.float32),
+        np.array(labels, dtype=np.int8),
+        np.array(groups, dtype=np.int64),
+    )
 
 
 def parse_chbmit_manifest():
@@ -160,6 +201,40 @@ def parse_chbmit_manifest():
     return manifest
 
 
+def _process_job(job):
+    """Worker: load + label one EDF. Runs in a separate process.
+
+    job = (patient_id, edf_path_str, seizure_times).
+    Returns (patient_id, filename, segments|None, labels|None, groups|None, error|None).
+    The interictal subsample is seeded deterministically per file (reproducible).
+    """
+    patient_id, edf_path, seizure_times = job
+    name = Path(edf_path).name
+    seed = (config.RANDOM_SEED + zlib.crc32(f"{patient_id}/{name}".encode())) % (2**32)
+    rng = np.random.default_rng(seed)
+    try:
+        data, sfreq = preprocess_edf(Path(edf_path))
+        segments, labels, groups = label_segments(data, seizure_times, sfreq, rng)
+    except Exception as exc:  # noqa: BLE001 - keep going on bad files
+        return patient_id, name, None, None, None, str(exc)
+    return patient_id, name, segments, labels, groups, None
+
+
+def _build_jobs(manifest):
+    """Resolve EDF paths and return the list of worker jobs (skipping missing)."""
+    jobs = []
+    for patient_id in sorted(manifest):
+        for edf_file, seizure_times in manifest[patient_id].items():
+            edf_path = config.DATA_DIR / patient_id / edf_file
+            if not edf_path.exists():
+                edf_path = config.DATA_DIR / edf_file  # flat layout fallback
+            if not edf_path.exists():
+                print(f"  - {patient_id}/{edf_file} not found (skipped)")
+                continue
+            jobs.append((patient_id, str(edf_path), seizure_times))
+    return jobs
+
+
 def main():
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -171,46 +246,102 @@ def main():
             "Download CHB-MIT first (see README)."
         )
 
-    all_segments, all_labels, patient_ids = [], [], []
+    jobs = _build_jobs(manifest)
+    print(f"Processing {len(jobs)} files with {config.NUM_WORKERS} worker(s)...")
 
-    for patient_id in sorted(manifest):
-        print(f"\n{patient_id}:")
-        for edf_file, seizure_times in manifest[patient_id].items():
-            edf_path = config.DATA_DIR / patient_id / edf_file
-            if not edf_path.exists():
-                edf_path = config.DATA_DIR / edf_file  # flat layout fallback
-            if not edf_path.exists():
-                print(f"  - {edf_file} not found (download incomplete?)")
-                continue
+    results = []
+    temp_dir = Path(tempfile.mkdtemp(prefix="neuroflow_preprocess_"))
 
-            try:
-                data, sfreq = preprocess_edf(edf_path)
-                segments, labels = label_segments(data, seizure_times, sfreq)
-            except Exception as exc:  # noqa: BLE001 - keep going on bad files
-                print(f"  x {edf_file}: {exc}")
-                continue
+    try:
+        with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as pool:
+            for patient_id, name, segments, labels, groups, err in pool.map(_process_job, jobs):
+                if err:
+                    print(f"  x {patient_id}/{name}: {err}")
+                    continue
+                if segments is None or segments.shape[0] == 0:
+                    continue
 
-            if segments.shape[0] == 0:
-                continue
-            all_segments.append(segments)
-            all_labels.append(labels)
-            patient_ids.extend([patient_id] * len(labels))
-            print(f"    {edf_file}: {len(labels)} segments ({int(labels.sum())} preictal)")
+                # Write intermediate chunks to disk to save memory
+                seg_file = temp_dir / f"{patient_id}_{name}_seg.npy"
+                lab_file = temp_dir / f"{patient_id}_{name}_lab.npy"
+                grp_file = temp_dir / f"{patient_id}_{name}_grp.npy"
+                np.save(seg_file, segments)
+                np.save(lab_file, labels)
+                np.save(grp_file, groups)
 
-    if not all_segments:
-        raise SystemExit("No segments produced. Check the dataset path and summaries.")
+                results.append(
+                    {
+                        "patient_id": patient_id,
+                        "name": name,
+                        "seg_file": seg_file,
+                        "lab_file": lab_file,
+                        "grp_file": grp_file,
+                        "n_segments": len(labels),
+                        "n_preictal": int(labels.sum()),
+                    }
+                )
+                print(f"  {patient_id}/{name}: {len(labels)} seg ({int(labels.sum())} preictal)")
 
-    segments = np.concatenate(all_segments, axis=0)
-    labels = np.concatenate(all_labels, axis=0)
+        if not results:
+            raise SystemExit("No segments produced. Check the dataset path and summaries.")
 
-    print("\nSaving preprocessed data...")
-    np.save(config.OUTPUT_DIR / "segments.npy", segments)
-    np.save(config.OUTPUT_DIR / "labels.npy", labels)
-    with open(config.OUTPUT_DIR / "patient_ids.json", "w") as f:
-        json.dump(patient_ids, f)
+        results.sort(key=lambda r: (r["patient_id"], r["name"]))  # stable patient/file order
 
-    print(f"Saved {segments.shape[0]} segments of shape {segments.shape[1:]}")
-    print(f"Preictal: {int(labels.sum())} | Interictal: {int((labels == 0).sum())}")
+        total_segments = sum(r["n_segments"] for r in results)
+        print(f"\nMerging {total_segments} segments to disk...")
+
+        segments_out = np.lib.format.open_memmap(
+            config.OUTPUT_DIR / "segments.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(total_segments, config.SEQ_LEN, config.N_CHANNELS),
+        )
+        labels_out = np.lib.format.open_memmap(
+            config.OUTPUT_DIR / "labels.npy", mode="w+", dtype=np.int8, shape=(total_segments,)
+        )
+
+        patient_ids = []
+        seizure_groups = []  # globally-unique seizure id per segment; "" for interictal
+        idx = 0
+        for r in results:
+            n = r["n_segments"]
+
+            # Read chunks, write to memmap, then free memory
+            seg_chunk = np.load(r["seg_file"])
+            lab_chunk = np.load(r["lab_file"])
+            grp_chunk = np.load(r["grp_file"])
+
+            segments_out[idx : idx + n] = seg_chunk
+            labels_out[idx : idx + n] = lab_chunk
+
+            # Delete chunk files to save disk space
+            r["seg_file"].unlink()
+            r["lab_file"].unlink()
+            r["grp_file"].unlink()
+
+            patient_ids.extend([r["patient_id"]] * n)
+            # Local group is the seizure onset (preictal) or -1 (interictal); make
+            # it globally unique with patient + file so seizures never collide.
+            for g in grp_chunk:
+                seizure_groups.append("" if g < 0 else f"{r['patient_id']}|{r['name']}|{int(g)}")
+            idx += n
+
+        segments_out.flush()
+        labels_out.flush()
+
+        with open(config.OUTPUT_DIR / "patient_ids.json", "w") as f:
+            json.dump(patient_ids, f)
+        with open(config.OUTPUT_DIR / "seizure_groups.json", "w") as f:
+            json.dump(seizure_groups, f)
+
+        total_preictal = sum(r["n_preictal"] for r in results)
+        total_interictal = total_segments - total_preictal
+        print(f"Saved {total_segments} segments of shape {segments_out.shape[1:]}")
+        print(f"Preictal: {total_preictal} | Interictal: {total_interictal}")
+
+    finally:
+        # Cleanup temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

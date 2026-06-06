@@ -9,11 +9,39 @@ Inputs are (batch, time, channels); the model emits a single preictal logit.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ncps.torch import CfC
 from pytorch_lightning import LightningModule
 from sklearn.metrics import roc_auc_score
 
 import config
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.5, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        # targets: (batch,)
+        # logits: (batch,)
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        # x: (batch, time, hidden_size)
+        attn_weights = F.softmax(self.attention(x), dim=1)  # (batch, time, 1)
+        context = torch.sum(attn_weights * x, dim=1)  # (batch, hidden_size)
+        return context
 
 
 class CfCSeizurePredictor(LightningModule):
@@ -26,25 +54,40 @@ class CfCSeizurePredictor(LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # CfC over the full sequence; last hidden state -> readout.
-        self.cfc = CfC(input_size, hidden_size, batch_first=True, return_sequences=False)
+        # Spatial Embedding Layer (1x1 conv over channels) to capture cross-channel relationships
+        self.spatial_embed = nn.Sequential(
+            nn.Linear(input_size, 64), nn.ReLU(), nn.Linear(64, input_size)
+        )
+
+        # CfC over the full sequence; return all sequences for temporal attention pooling
+        self.cfc = CfC(input_size, hidden_size, batch_first=True, return_sequences=True)
+
+        # Temporal Attention Pooling
+        self.attention = AdditiveAttention(hidden_size)
+
         self.readout = nn.Sequential(
             nn.Linear(hidden_size, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(config.DROPOUT),
             nn.Linear(64, 1),
         )
-        # Logits + BCEWithLogits is numerically stable under 16-bit mixed precision
-        # (plain Sigmoid + BCELoss can produce NaNs there).
-        self.criterion = nn.BCEWithLogitsLoss()
+        # Cost-Sensitive Focal Loss (heavily penalize false negatives)
+        self.criterion = FocalLoss(alpha=0.75, gamma=2.0)
 
         self._val_preds = []
         self._val_targets = []
 
     def forward(self, x):
         """x: (batch, time, channels) -> (batch,) logits."""
-        out, _ = self.cfc(x)  # (batch, hidden_size)
-        return self.readout(out).squeeze(-1)
+        # Spatial embedding applied at each timestep
+        x = self.spatial_embed(x)  # (batch, time, input_size)
+
+        out, _ = self.cfc(x)  # (batch, time, hidden_size)
+
+        # Attention pooling over time
+        context = self.attention(out)  # (batch, hidden_size)
+
+        return self.readout(context).squeeze(-1)
 
     @torch.no_grad()
     def predict_proba(self, x):
@@ -81,7 +124,12 @@ class CfCSeizurePredictor(LightningModule):
         self._val_targets.clear()
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        # AdamW's decoupled weight decay regularizes to reduce cross-patient overfit.
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=config.WEIGHT_DECAY,
+        )
 
 
 if __name__ == "__main__":

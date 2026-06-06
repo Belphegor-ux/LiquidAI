@@ -10,15 +10,17 @@ Run:  python download_lfm.py
 """
 
 import concurrent.futures
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-import config
-
-REPO = config.LLM_MODEL
+# Always the HF repo id -- config.LLM_MODEL becomes a LOCAL path once downloaded,
+# which would build an invalid URL on re-run.
+REPO = "LiquidAI/LFM2.5-1.2B-Instruct"
 DEST = Path("models") / REPO.split("/")[-1].lower()
 BASE = f"https://huggingface.co/{REPO}/resolve/main"
+NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
 SMALL_FILES = [
     "config.json",
     "generation_config.json",
@@ -39,7 +41,7 @@ def _curl_to(url: str, dest: Path, extra: list[str] | None = None) -> bool:
 
 def _resolve_signed(url: str) -> str:
     out = subprocess.run(
-        ["curl", "-s", "-o", "/dev/null", "-w", "%{url_effective}", "-L", url],
+        ["curl", "-s", "-o", NULL_DEVICE, "-w", "%{url_effective}", "-L", url],
         capture_output=True,
         text=True,
     )

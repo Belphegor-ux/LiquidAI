@@ -25,6 +25,11 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
+# Use Tensor-Core TF32 matmuls on the RTX 3050 -- a free speedup for the dense
+# layers; the CfC recurrence is the main cost but every bit helps.
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
+
 
 def _resume_ckpt():
     """Latest 'last' checkpoint to resume from, or None.
@@ -65,29 +70,42 @@ def main():
     train_ds = TensorDataset(segments[train_idx], labels[train_idx])
     val_ds = TensorDataset(segments[val_idx], labels[val_idx])
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.BATCH_SIZE,
-        sampler=_weighted_sampler(labels_np[train_idx]),
-        num_workers=0,
-    )
+    if config.USE_WEIGHTED_SAMPLER:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=config.BATCH_SIZE,
+            sampler=_weighted_sampler(labels_np[train_idx]),
+            num_workers=0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0
+        )
     val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
 
     model = CfCSeizurePredictor()
 
+    # Monitor val_loss (focal): defined on every batch and stable, unlike val_auc
+    # which is rank-noisy on small val sets.
     checkpoint = ModelCheckpoint(
         dirpath=str(config.MODEL_DIR),
-        filename="cfc100-{epoch:02d}-{val_auc:.3f}",
-        monitor="val_auc",
-        mode="max",
+        filename="cfc100-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
         save_top_k=1,
         save_last=True,
     )
-    early_stop = EarlyStopping(monitor="val_auc", mode="max", patience=20)
+    callbacks = [checkpoint]
+    if config.EARLY_STOP_PATIENCE > 0:
+        callbacks.append(
+            EarlyStopping(monitor="val_loss", mode="min", patience=config.EARLY_STOP_PATIENCE)
+        )
+    else:
+        print("Early stopping disabled; training full", config.MAX_EPOCHS, "epochs.")
 
     trainer = Trainer(
         max_epochs=config.MAX_EPOCHS,
-        callbacks=[checkpoint, early_stop],
+        callbacks=callbacks,
         accelerator="auto",
         devices=1,
         log_every_n_steps=10,

@@ -47,7 +47,9 @@ patient_ids = load_patient_ids()
 with st.sidebar:
     st.header("Model Info")
     st.metric("Architecture", f"CfC-{config.HIDDEN_SIZE}")
-    st.metric("Sequence length", f"{config.SEQ_LEN} steps @ {config.DOWNSAMPLE_HZ} Hz")
+    st.metric(
+        "Epoch", f"{config.EPOCH_SECONDS}s = {config.SEQ_LEN} steps @ {config.EPOCH_SAMPLE_RATE} Hz"
+    )
     st.metric("Channels", config.N_CHANNELS)
     if st.button("Load random segment"):
         st.session_state.pop("idx", None)
