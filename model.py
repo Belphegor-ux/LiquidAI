@@ -47,7 +47,7 @@ class AdditiveAttention(nn.Module):
 class CfCSeizurePredictor(LightningModule):
     def __init__(
         self,
-        input_size=115,
+        input_size=config.N_CHANNELS,
         hidden_size=config.HIDDEN_SIZE,
         learning_rate=config.LEARNING_RATE,
     ):
@@ -134,6 +134,6 @@ class CfCSeizurePredictor(LightningModule):
 
 if __name__ == "__main__":
     model = CfCSeizurePredictor()
-    dummy = torch.randn(4, 1, 115)
+    dummy = torch.randn(4, config.SEQ_LEN, config.N_CHANNELS)
     out = model(dummy)
     print(f"OK - output shape {tuple(out.shape)} (expected (4,))")
