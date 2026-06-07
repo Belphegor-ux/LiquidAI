@@ -53,24 +53,35 @@ python evaluate.py
 # Otherwise rebuild from raw:  preprocess.py -> split_patients.py -> train.py -> evaluate.py
 ```
 
-## ⚠️ Repo is mid-pivot (read before running)
+## 4. Run the dashboard (backend + frontend)
 
-The repo is currently in a **work-in-progress spectral pivot** and is **not
-runnable end-to-end as-is**:
+```bash
+# Terminal 1 — FastAPI inference API on http://localhost:8000
+$env:PYTHONUTF8 = "1"     # Windows cp932 consoles
+python server.py
 
-- `model.py` was changed to `input_size=115` (hardcoded — should move to
-  `config.py`) and `train.py` loads `segments_spectral.npy` (produced by
-  `process_spectral.py` + `extract_features.py`). This is the band-power
-  feature path ("path b").
-- The committed checkpoint `models/cfc100-epoch=02-val_loss=0.1097.ckpt`
-  expects the **old** `(1280, 23)` raw-epoch input, and `server.py` loads that
-  checkpoint via `find_checkpoint()`. So the **model code and the saved
-  checkpoint / API are inconsistent** right now.
+# Terminal 2 — Vite dev server on http://localhost:5173
+cd frontend
+npm run dev
+```
 
-To run the *original* working pipeline, revert `model.py` (`input_size` back to
-`config.N_CHANNELS`) and `train.py` (load `segments.npy`). To continue the
-spectral pivot, run `process_spectral.py` to build `segments_spectral.npy`, then
-retrain — and update `server.py` / the frontend to the new input contract.
+The sidebar pulls real per-patient risk from `/api/ward` (batched model
+inference over the replayed epochs) and the spatial panel from `/api/predict`.
+If the backend is down, the frontend falls back to placeholders / a
+deterministic feed.
+
+## Status (read before running)
+
+The repo is in the **runnable raw-epoch state** (restored in commit
+`840d42b`): `model.py` uses `input_size=config.N_CHANNELS`, `train.py` loads
+`segments.npy`, and `server.py` pins the matching raw-epoch checkpoint via
+`_pin_raw_checkpoint()`. The pipeline runs end-to-end as-is.
+
+Optional spectral pivot ("path b", band-power features) is **scaffolding only**
+and not wired into the default pipeline: `extract_features.py` /
+`process_spectral.py` build `segments_spectral.npy`, but using them means
+retraining with a 115-input model and updating the `server.py` / frontend input
+contract. `finetune.py` is the alternative per-patient path ("path c").
 
 See `RESULTS.md` for the honest metrics (mean per-patient test AUROC ≈ 0.475)
 and `CLAUDE.md` for full project status.
