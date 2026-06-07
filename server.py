@@ -45,7 +45,12 @@ _model = None
 _device = None
 _segments = None
 _patient_index: dict[str, np.ndarray] = {}
-_cursor: dict[str, int] = {}  # per-patient replay position
+_cursor: dict[str, int] = {}  # per-patient replay position (main panel)
+_ward_cursor: dict[str, int] = {}  # per-patient replay position (sidebar ward list)
+
+# Default ward roster shown in the sidebar when the frontend doesn't pass one.
+DEFAULT_WARD = ("CHB-01", "CHB-02", "CHB-03", "CHB-04", "CHB-05", "CHB-06", "CHB-08", "CHB-17")
+WARNING_THRESHOLD = 0.5  # predict_proba above this flags the patient as WARNING
 
 
 def _pin_raw_checkpoint() -> str:
@@ -158,6 +163,56 @@ def predict(patient_id: str = "CHB-01"):
             "risk_level": "HIGH" if prob > 0.5 else "LOW",
             "channel_data": _regional_activity(sample, risk_pct),
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/ward")
+def ward(patient_ids: str = ",".join(DEFAULT_WARD)):
+    """Real per-patient risk for the sidebar ward list.
+
+    Replays the next real epoch for each requested patient and scores them all
+    in a single batched forward pass, so the sidebar shows live model output
+    instead of hard-coded numbers. Patients with no preprocessed epochs are
+    skipped (logged via the `status` field). Uses a ward-specific cursor so it
+    doesn't interfere with the main panel's `/api/predict` replay position.
+    """
+    try:
+        model, device, segments = _load()
+        requested = [p.strip() for p in patient_ids.split(",") if p.strip()]
+
+        scored, samples = [], []
+        for raw in requested:
+            pid = _normalize_patient_id(raw)
+            if pid not in _patient_index:
+                scored.append({"id": raw, "status": "NO DATA", "risk": None})
+                continue
+            epochs = _patient_index[pid]
+            pos = _ward_cursor.get(pid, 0) % len(epochs)
+            _ward_cursor[pid] = (pos + 1) % len(epochs)
+            seg_idx = int(epochs[pos])
+            samples.append((raw, np.array(segments[seg_idx])))  # copy out of read-only mmap
+
+        if samples:
+            batch = torch.from_numpy(np.stack([s for _, s in samples])).float().to(device)
+            with torch.no_grad():
+                probs = model.predict_proba(batch).cpu().numpy().reshape(-1)
+            for (raw, _), prob in zip(samples, probs, strict=True):
+                p = float(prob)
+                scored.append(
+                    {
+                        "id": raw,
+                        "status": "WARNING" if p > WARNING_THRESHOLD else "STABLE",
+                        "risk": round(p * 100.0, 1),
+                    }
+                )
+
+        # Preserve the requested order (batched/skipped entries are interleaved above).
+        order = {raw: i for i, raw in enumerate(requested)}
+        scored.sort(key=lambda r: order.get(r["id"], len(order)))
+        return {"status": "success", "patients": scored}
     except HTTPException:
         raise
     except Exception as e:

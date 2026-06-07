@@ -67,6 +67,13 @@ const activityColor = (v: number) =>
   v >= 62 ? 'var(--danger-color)' : v >= 38 ? '#dd6b20' : 'var(--success-color)';
 
 type RegionDatum = { name: string; activity: number; variance: number };
+type WardPatient = { id: string; status: string; risk: number | null };
+
+// Roster requested from the backend; the API returns real per-patient risk for each.
+const WARD_ROSTER = ["CHB-01", "CHB-02", "CHB-03", "CHB-04", "CHB-05", "CHB-06", "CHB-08", "CHB-17"];
+
+// Shown before the first /api/ward response (and if the backend is unreachable).
+const WARD_FALLBACK: WardPatient[] = WARD_ROSTER.map((id) => ({ id, status: "—", risk: null }));
 
 function App() {
   const [activePatient, setActivePatient] = useState("CHB-01");
@@ -75,6 +82,8 @@ function App() {
   const [tick, setTick] = useState(0);
   // Real per-region band power from the backend (null when the API is unreachable).
   const [liveChannels, setLiveChannels] = useState<RegionDatum[] | null>(null);
+  // Real per-patient risk for the ward sidebar (falls back to placeholders until loaded).
+  const [wardPatients, setWardPatients] = useState<WardPatient[]>(WARD_FALLBACK);
 
   // Prefer real backend data; fall back to a deterministic per-patient feed that
   // still differs per patient and breathes via `tick` (fixes the old constant panel).
@@ -89,17 +98,27 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Mock patient ward list
-  const wardPatients = [
-    { id: "CHB-01", status: "STABLE", risk: 12 },
-    { id: "CHB-02", status: "WARNING", risk: 78 },
-    { id: "CHB-03", status: "STABLE", risk: 8 },
-    { id: "CHB-04", status: "STABLE", risk: 15 },
-    { id: "CHB-05", status: "WARNING", risk: 62 },
-    { id: "CHB-06", status: "STABLE", risk: 5 },
-    { id: "CHB-08", status: "STABLE", risk: 19 },
-    { id: "CHB-17", status: "STABLE", risk: 22 }
-  ];
+  // Poll real per-patient risk for the whole ward in one batched backend call.
+  useEffect(() => {
+    const fetchWard = async () => {
+      try {
+        const res = await fetch(
+          `http://localhost:8000/api/ward?patient_ids=${WARD_ROSTER.join(',')}`
+        );
+        const data = await res.json();
+        if (data.status === 'success' && Array.isArray(data.patients)) {
+          setWardPatients(data.patients as WardPatient[]);
+        }
+      } catch {
+        // Backend down/unreachable — keep the last known roster (placeholders on first load).
+        setWardPatients((prev) => prev);
+      }
+    };
+
+    fetchWard();
+    const interval = setInterval(fetchWard, 2000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Fetch real-time risk updates from the FastAPI backend
   useEffect(() => {
@@ -159,28 +178,34 @@ function App() {
         <div style={{display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px', color: 'var(--text-primary)', fontWeight: 600}}>
           <Users size={20} /> Neurological ICU
         </div>
-        {wardPatients.map(p => (
-          <div 
-            key={p.id} 
-            className={`patient-tab ${activePatient === p.id ? 'active' : ''}`}
-            onClick={() => {
-              setActivePatient(p.id);
-              setRiskScore(p.risk);
-              setTimelineData(generateTimelineData(p.risk));
-              setLiveChannels(null); // show deterministic feed until the new patient's data arrives
-            }}
-          >
-            <div>
-              <div style={{fontWeight: 600}}>{p.id}</div>
-              <div style={{fontSize: '0.8rem', color: p.status === 'WARNING' ? 'var(--danger-color)' : 'var(--success-color)'}}>
-                {p.status}
+        {wardPatients.map(p => {
+          const isWarn = p.status === 'WARNING';
+          const hasRisk = p.risk !== null;
+          return (
+            <div
+              key={p.id}
+              className={`patient-tab ${activePatient === p.id ? 'active' : ''}`}
+              onClick={() => {
+                setActivePatient(p.id);
+                if (hasRisk) {
+                  setRiskScore(p.risk as number);
+                  setTimelineData(generateTimelineData(p.risk as number));
+                }
+                setLiveChannels(null); // show deterministic feed until the new patient's data arrives
+              }}
+            >
+              <div>
+                <div style={{fontWeight: 600}}>{p.id}</div>
+                <div style={{fontSize: '0.8rem', color: isWarn ? 'var(--danger-color)' : 'var(--success-color)'}}>
+                  {p.status}
+                </div>
+              </div>
+              <div style={{fontSize: '1.2rem', fontWeight: 600, color: isWarn ? 'var(--danger-color)' : 'var(--text-secondary)'}}>
+                {hasRisk ? `${p.risk}%` : '—'}
               </div>
             </div>
-            <div style={{fontSize: '1.2rem', fontWeight: 600, color: p.status === 'WARNING' ? 'var(--danger-color)' : 'var(--text-secondary)'}}>
-              {p.risk}%
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Main Clinical Dashboard */}
