@@ -66,17 +66,21 @@ const computeRegionalActivity = (patientId: string, risk: number, step: number) 
 const activityColor = (v: number) =>
   v >= 62 ? 'var(--danger-color)' : v >= 38 ? '#dd6b20' : 'var(--success-color)';
 
+type RegionDatum = { name: string; activity: number; variance: number };
+
 function App() {
   const [activePatient, setActivePatient] = useState("CHB-01");
   const [riskScore, setRiskScore] = useState(12.4);
   const [timelineData, setTimelineData] = useState(generateTimelineData());
   const [tick, setTick] = useState(0);
+  // Real per-region band power from the backend (null when the API is unreachable).
+  const [liveChannels, setLiveChannels] = useState<RegionDatum[] | null>(null);
 
-  // Regional activity is DERIVED — deterministic per patient + risk, animated by `tick`.
-  // This is the fix for "GNN panel never changes": it was hard-coded to a constant before.
+  // Prefer real backend data; fall back to a deterministic per-patient feed that
+  // still differs per patient and breathes via `tick` (fixes the old constant panel).
   const channelData = useMemo(
-    () => computeRegionalActivity(activePatient, riskScore, tick),
-    [activePatient, riskScore, tick]
+    () => liveChannels ?? computeRegionalActivity(activePatient, riskScore, tick),
+    [liveChannels, activePatient, riskScore, tick]
   );
 
   // Drives the deterministic "breathing" of the spatial-activity bars (1 s cadence).
@@ -108,6 +112,11 @@ function App() {
           const riskPercentage = Number((data.predict_proba * 100).toFixed(1));
           setRiskScore(riskPercentage);
 
+          // Real regional band power from the actual EEG epoch.
+          if (Array.isArray(data.channel_data)) {
+            setLiveChannels(data.channel_data as RegionDatum[]);
+          }
+
           setTimelineData(prev => {
             const newTimeline = [...prev.slice(1)];
             const time = new Date();
@@ -119,8 +128,8 @@ function App() {
           });
         }
       } catch (err) {
-        // Fallback for demo when backend is down/unreachable
-        // Keep the previous risk and channel data to prevent jumping
+        // Backend down/unreachable — drop to the deterministic per-patient feed.
+        setLiveChannels(null);
         setRiskScore(prevRisk => {
           setTimelineData(prev => {
             const newTimeline = [...prev.slice(1)];
@@ -158,6 +167,7 @@ function App() {
               setActivePatient(p.id);
               setRiskScore(p.risk);
               setTimelineData(generateTimelineData(p.risk));
+              setLiveChannels(null); // show deterministic feed until the new patient's data arrives
             }}
           >
             <div>
