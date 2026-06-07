@@ -2,6 +2,7 @@
 data/
 models/
 logs/
+lightning_logs/
 results/
 ncps/
 *.edf

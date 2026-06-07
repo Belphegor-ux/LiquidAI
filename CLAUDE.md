@@ -49,3 +49,32 @@ CHB-MIT EDFs live outside the repo (default `~/chbmit`, set `NEUROFLOW_DATA_DIR`
 
 `ncps` (Liquid networks), `torch`, `pytorch-lightning`, `mne`, `scikit-learn`,
 `scipy`, `streamlit`. See `requirements.txt`.
+
+## Current status (updated 2026-06-06)
+
+**Run 3 shipped.** 19 patients (chb01–chb19), 28,193 epochs, 133 seizures. Best
+checkpoint `models/cfc100-epoch=02-val_loss=0.1097.ckpt`.
+
+- **Honest headline metric: mean per-patient (subject-wise) test AUROC ≈ 0.475
+  (chance).** The *pooled* AUROC (0.578) is inflated by differing per-patient
+  preictal base rates — always report the per-patient number (`evaluate.py`
+  prints both). Cross-patient prediction is the open problem; see `RESULTS.md`.
+- Pipeline, checkpoint, and LFM2.5 explainer are all functional end-to-end.
+- A silent montage bug was fixed: `config.CANONICAL_CHANNELS` selects the 23-name
+  bipolar montage by name (chb12+ pad with placeholder/extra/duplicate channels);
+  this also enforces consistent channel order.
+
+**Resume next session (needs Antigravity API-contract coordination):** to get real
+signal, choose (b) spectral/band-power features [changes the `(1280, 23)` model
+input → breaks the current API contract] or (c) patient-specific calibration /
+fine-tuning [keeps the contract, reframes as patient-adaptive]. Consider
+leave-one-patient-out CV + Wilson CIs (3-patient test set is high-variance).
+`frontend/` (Vite/React) + `server.py` (FastAPI) are Antigravity's; both are now
+committed (run `npm install` in `frontend/` on a fresh checkout — `node_modules`
+is git-ignored). Scaffolding for both improvement paths is in the repo:
+`extract_features.py` (path b, band-power) and `finetune.py` (path c, per-patient).
+
+**Env gotchas:** Windows + Bash tool — no PowerShell here-strings in Bash (use
+`-m`×N or `<<'EOF'`); set `PYTHONUTF8=1` for scripts (cp932 console); repo is in
+OneDrive (avoid git worktrees there); training logs to TensorBoard event files,
+not `metrics.csv`. Use the `/commit` skill for safe staging/commits.

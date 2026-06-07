@@ -59,7 +59,7 @@ def main():
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    segments = torch.from_numpy(np.load(config.OUTPUT_DIR / "segments.npy")).float()
+    segments = torch.from_numpy(np.load(config.OUTPUT_DIR / "segments_spectral.npy")).float()
     labels_np = np.load(config.OUTPUT_DIR / "labels.npy").astype(np.int64)
     labels = torch.from_numpy(labels_np)
 
